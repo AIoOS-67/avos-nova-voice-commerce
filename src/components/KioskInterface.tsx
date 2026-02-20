@@ -26,6 +26,8 @@ export default function KioskInterface() {
   const [activeCards, setActiveCards] = useState<CardDisplay[]>([]);
   const [cartCount, setCartCount] = useState(0);
   const [cartTotal, setCartTotal] = useState(0);
+  const [voiceLang, setVoiceLang] = useState<"en-US" | "zh-CN">("en-US");
+  const [interimText, setInterimText] = useState("");
   const messagesEndRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
@@ -100,27 +102,59 @@ export default function KioskInterface() {
   const handleVoiceInput = useCallback(() => {
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     if (!("webkitSpeechRecognition" in window || "SpeechRecognition" in window)) {
-      alert("Voice input is not supported in this browser. Please use Chrome.");
+      alert("Voice input is not supported in this browser. Please use Chrome or Edge.");
       return;
     }
+
+    if (isListening) return; // prevent double-tap
 
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     const SpeechRecognition = (window as any).webkitSpeechRecognition || (window as any).SpeechRecognition;
     const recognition = new SpeechRecognition();
     recognition.continuous = false;
-    recognition.interimResults = false;
-    recognition.lang = "en-US";
+    recognition.interimResults = true;
+    recognition.lang = voiceLang;
 
-    recognition.onstart = () => setIsListening(true);
-    recognition.onend = () => setIsListening(false);
+    recognition.onstart = () => {
+      setIsListening(true);
+      setInterimText("");
+    };
+    recognition.onend = () => {
+      setIsListening(false);
+      setInterimText("");
+    };
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     recognition.onresult = (event: any) => {
-      const transcript = event.results[0][0].transcript;
-      sendMessage(transcript);
+      let finalTranscript = "";
+      let interim = "";
+      for (let i = 0; i < event.results.length; i++) {
+        if (event.results[i].isFinal) {
+          finalTranscript += event.results[i][0].transcript;
+        } else {
+          interim += event.results[i][0].transcript;
+        }
+      }
+      if (finalTranscript) {
+        setInterimText("");
+        sendMessage(finalTranscript);
+      } else {
+        setInterimText(interim);
+      }
     };
-    recognition.onerror = () => setIsListening(false);
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    recognition.onerror = (event: any) => {
+      setIsListening(false);
+      setInterimText("");
+      if (event.error === "not-allowed") {
+        alert("Microphone access denied. Please allow microphone permission and try again.");
+      } else if (event.error === "no-speech") {
+        // silent — user just didn't speak
+      } else {
+        console.error("Speech recognition error:", event.error);
+      }
+    };
     recognition.start();
-  }, [sendMessage]);
+  }, [sendMessage, voiceLang, isListening]);
 
   return (
     <div className="h-screen flex flex-col bg-[#0a0a0a]">
@@ -150,10 +184,28 @@ export default function KioskInterface() {
             )}
           </button>
           {/* Language Toggle */}
-          <div className="flex items-center gap-1 text-xs text-zinc-400">
-            <span className="bg-zinc-800 px-2 py-1 rounded">EN</span>
-            <span>/</span>
-            <span className="bg-zinc-800 px-2 py-1 rounded">中文</span>
+          <div className="flex items-center gap-1 text-xs">
+            <button
+              onClick={() => setVoiceLang("en-US")}
+              className={`px-2 py-1 rounded transition-colors ${
+                voiceLang === "en-US"
+                  ? "bg-orange-600 text-white"
+                  : "bg-zinc-800 text-zinc-400 hover:bg-zinc-700"
+              }`}
+            >
+              EN
+            </button>
+            <span className="text-zinc-500">/</span>
+            <button
+              onClick={() => setVoiceLang("zh-CN")}
+              className={`px-2 py-1 rounded transition-colors ${
+                voiceLang === "zh-CN"
+                  ? "bg-orange-600 text-white"
+                  : "bg-zinc-800 text-zinc-400 hover:bg-zinc-700"
+              }`}
+            >
+              中文
+            </button>
           </div>
         </div>
       </header>
@@ -246,12 +298,17 @@ export default function KioskInterface() {
               {/* Text Input */}
               <input
                 type="text"
-                value={input}
-                onChange={(e) => setInput(e.target.value)}
+                value={isListening && interimText ? interimText : input}
+                onChange={(e) => { if (!isListening) setInput(e.target.value); }}
                 onKeyDown={(e) => e.key === "Enter" && sendMessage(input)}
-                placeholder="Type your order or tap the mic..."
+                placeholder={isListening
+                  ? (voiceLang === "zh-CN" ? "正在听..." : "Listening...")
+                  : (voiceLang === "zh-CN" ? "输入您的点餐或点击麦克风..." : "Type your order or tap the mic...")}
                 disabled={isLoading}
-                className="flex-1 bg-zinc-800 border border-zinc-700 rounded-xl px-4 py-3 text-sm text-white placeholder-zinc-500 focus:outline-none focus:border-orange-500 transition-colors disabled:opacity-50"
+                readOnly={isListening}
+                className={`flex-1 bg-zinc-800 border rounded-xl px-4 py-3 text-sm text-white placeholder-zinc-500 focus:outline-none transition-colors disabled:opacity-50 ${
+                  isListening ? "border-red-500 bg-zinc-800/80" : "border-zinc-700 focus:border-orange-500"
+                }`}
               />
 
               {/* Send Button */}
