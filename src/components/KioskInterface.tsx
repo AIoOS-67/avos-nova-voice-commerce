@@ -18,24 +18,81 @@ interface CardDisplay {
   recommendationBadge?: string;
 }
 
+// ---------------------------------------------------------------------------
+// TTS helper — speaks text and resolves when done
+// ---------------------------------------------------------------------------
+function speakText(text: string, lang: "en-US" | "zh-CN"): Promise<void> {
+  return new Promise((resolve) => {
+    if (!("speechSynthesis" in window)) { resolve(); return; }
+    window.speechSynthesis.cancel(); // stop any ongoing speech
+    const utt = new SpeechSynthesisUtterance(text);
+    utt.lang = lang;
+    utt.rate = 1.05;
+    utt.pitch = 1;
+    // Try to find a matching voice
+    const voices = window.speechSynthesis.getVoices();
+    const match = voices.find((v) => v.lang.startsWith(lang.split("-")[0]));
+    if (match) utt.voice = match;
+    utt.onend = () => resolve();
+    utt.onerror = () => resolve();
+    window.speechSynthesis.speak(utt);
+  });
+}
+
+// Detect if text is mostly Chinese
+function isChinese(text: string): boolean {
+  const zhChars = text.match(/[\u4e00-\u9fff]/g);
+  return !!zhChars && zhChars.length > text.length * 0.15;
+}
+
 export default function KioskInterface() {
   const [messages, setMessages] = useState<Message[]>([]);
   const [input, setInput] = useState("");
   const [isLoading, setIsLoading] = useState(false);
   const [isListening, setIsListening] = useState(false);
+  const [isSpeaking, setIsSpeaking] = useState(false);
+  const [voiceMode, setVoiceMode] = useState(false); // full voice conversation mode
   const [activeCards, setActiveCards] = useState<CardDisplay[]>([]);
   const [cartCount, setCartCount] = useState(0);
   const [cartTotal, setCartTotal] = useState(0);
   const [voiceLang, setVoiceLang] = useState<"en-US" | "zh-CN">("en-US");
   const [interimText, setInterimText] = useState("");
+  const [welcomed, setWelcomed] = useState(false);
   const messagesEndRef = useRef<HTMLDivElement>(null);
+  const voiceModeRef = useRef(false); // ref to avoid stale closure
 
   useEffect(() => {
     messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
   }, [messages]);
 
+  // Keep ref in sync
+  useEffect(() => { voiceModeRef.current = voiceMode; }, [voiceMode]);
+
+  // Load voices (needed for some browsers)
+  useEffect(() => {
+    if ("speechSynthesis" in window) {
+      window.speechSynthesis.getVoices();
+      window.speechSynthesis.onvoiceschanged = () => window.speechSynthesis.getVoices();
+    }
+  }, []);
+
   const removeCard = useCallback((cardId: string) => {
     setActiveCards((prev) => prev.filter((c) => c.id !== cardId));
+  }, []);
+
+  // Speak assistant response and optionally auto-listen after
+  const speakAndListen = useCallback(async (text: string) => {
+    setIsSpeaking(true);
+    const lang = isChinese(text) ? "zh-CN" : "en-US";
+    await speakText(text, lang);
+    setIsSpeaking(false);
+    // Auto-listen if in voice mode
+    if (voiceModeRef.current) {
+      setTimeout(() => {
+        // Trigger voice input
+        document.getElementById("avos-mic-btn")?.click();
+      }, 500);
+    }
   }, []);
 
   const sendMessage = useCallback(
@@ -62,6 +119,8 @@ export default function KioskInterface() {
             ...prev,
             { role: "assistant", content: data.response, timestamp: Date.now() },
           ]);
+          // Speak the response
+          speakAndListen(data.response);
         }
 
         // Process bridge cards (Patent #28 core)
@@ -84,20 +143,35 @@ export default function KioskInterface() {
           setCartTotal(data.cartState.total || 0);
         }
       } catch {
+        const errMsg = "Sorry, I had trouble processing that. Could you try again?";
         setMessages((prev) => [
           ...prev,
-          {
-            role: "assistant",
-            content: "Sorry, I had trouble processing that. Could you try again?",
-            timestamp: Date.now(),
-          },
+          { role: "assistant", content: errMsg, timestamp: Date.now() },
         ]);
+        speakAndListen(errMsg);
       } finally {
         setIsLoading(false);
       }
     },
-    [isLoading, messages]
+    [isLoading, messages, speakAndListen]
   );
+
+  // Start voice conversation — welcome + auto-listen
+  const startVoiceConversation = useCallback(async () => {
+    setVoiceMode(true);
+    voiceModeRef.current = true;
+
+    const greeting = voiceLang === "zh-CN"
+      ? "欢迎光临！我是AVOS，您的AI点餐助手。请问您想吃点什么？"
+      : "Welcome! I'm AVOS, your AI ordering assistant. What would you like to order today?";
+
+    const greetMsg: Message = { role: "assistant", content: greeting, timestamp: Date.now() };
+    setMessages((prev) => [...prev, greetMsg]);
+    setWelcomed(true);
+
+    // Speak greeting, then auto-listen
+    await speakAndListen(greeting);
+  }, [voiceLang, speakAndListen]);
 
   const handleVoiceInput = useCallback(() => {
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -106,7 +180,7 @@ export default function KioskInterface() {
       return;
     }
 
-    if (isListening) return; // prevent double-tap
+    if (isListening || isSpeaking) return; // prevent double-tap or listening while speaking
 
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     const SpeechRecognition = (window as any).webkitSpeechRecognition || (window as any).SpeechRecognition;
@@ -148,18 +222,23 @@ export default function KioskInterface() {
       if (event.error === "not-allowed") {
         alert("Microphone access denied. Please allow microphone permission and try again.");
       } else if (event.error === "no-speech") {
-        // silent — user just didn't speak
+        // silent — user just didn't speak, auto-retry in voice mode
+        if (voiceModeRef.current) {
+          setTimeout(() => {
+            document.getElementById("avos-mic-btn")?.click();
+          }, 1000);
+        }
       } else {
         console.error("Speech recognition error:", event.error);
       }
     };
     recognition.start();
-  }, [sendMessage, voiceLang, isListening]);
+  }, [sendMessage, voiceLang, isListening, isSpeaking]);
 
   return (
     <div className="h-screen flex flex-col bg-[#0a0a0a]">
       {/* Header */}
-      <header className="flex items-center justify-between px-6 py-4 border-b border-zinc-800 bg-zinc-950">
+      <header className="flex items-center justify-between px-4 sm:px-6 py-3 border-b border-zinc-800 bg-zinc-950">
         <div className="flex items-center gap-3">
           <div className="w-10 h-10 rounded-lg bg-gradient-to-br from-orange-500 to-red-600 flex items-center justify-center text-xl">
             🍜
@@ -171,7 +250,7 @@ export default function KioskInterface() {
             <p className="text-xs text-zinc-500">Powered by Amazon Nova #AmazonNova</p>
           </div>
         </div>
-        <div className="flex items-center gap-4">
+        <div className="flex items-center gap-2 sm:gap-4">
           {/* Cart */}
           <button
             onClick={() => sendMessage("What is my total?")}
@@ -207,6 +286,15 @@ export default function KioskInterface() {
               中文
             </button>
           </div>
+          {/* Voice Mode Toggle */}
+          {voiceMode && (
+            <button
+              onClick={() => { setVoiceMode(false); voiceModeRef.current = false; window.speechSynthesis?.cancel(); }}
+              className="px-2 py-1 rounded bg-red-600 text-white text-xs animate-pulse"
+            >
+              End Voice
+            </button>
+          )}
         </div>
       </header>
 
@@ -216,17 +304,25 @@ export default function KioskInterface() {
         <div className="flex-1 flex flex-col min-w-0">
           {/* Messages */}
           <div className="flex-1 overflow-y-auto p-4 space-y-3">
-            {/* Welcome message */}
-            {messages.length === 0 && (
-              <div className="flex flex-col items-center justify-center h-full text-center space-y-4 opacity-60">
+            {/* Welcome — start voice conversation */}
+            {messages.length === 0 && !welcomed && (
+              <div className="flex flex-col items-center justify-center h-full text-center space-y-6">
                 <div className="text-6xl">🍜</div>
                 <h2 className="text-xl font-bold">Welcome to AVOS</h2>
                 <p className="text-sm text-zinc-400 max-w-md">
-                  Order by voice or text. Try saying{" "}
-                  <span className="text-orange-400">&quot;I&apos;d like some Kung Pao Chicken&quot;</span> or{" "}
-                  <span className="text-orange-400">&quot;我要宫保鸡丁&quot;</span>
+                  AI Voice Ordering System — speak naturally to order!
                 </p>
-                <div className="flex flex-wrap gap-2 justify-center mt-4">
+
+                {/* Big Start Voice Button */}
+                <button
+                  onClick={startVoiceConversation}
+                  className="w-24 h-24 rounded-full bg-gradient-to-br from-orange-500 to-red-600 flex items-center justify-center text-4xl shadow-lg shadow-orange-500/30 hover:shadow-orange-500/50 hover:scale-105 transition-all active:scale-95"
+                >
+                  🎙️
+                </button>
+                <p className="text-xs text-zinc-500">Tap to start voice conversation</p>
+
+                <div className="flex flex-wrap gap-2 justify-center mt-2">
                   {[
                     "What's on the menu?",
                     "I'll have General Tso's Chicken",
@@ -235,7 +331,7 @@ export default function KioskInterface() {
                   ].map((suggestion) => (
                     <button
                       key={suggestion}
-                      onClick={() => sendMessage(suggestion)}
+                      onClick={() => { setWelcomed(true); sendMessage(suggestion); }}
                       className="text-xs bg-zinc-800 hover:bg-zinc-700 px-3 py-1.5 rounded-full transition-colors border border-zinc-700"
                     >
                       {suggestion}
@@ -251,7 +347,7 @@ export default function KioskInterface() {
                 className={`flex ${msg.role === "user" ? "justify-end" : "justify-start"}`}
               >
                 <div
-                  className={`max-w-[80%] rounded-2xl px-4 py-2.5 ${
+                  className={`max-w-[85%] rounded-2xl px-4 py-2.5 ${
                     msg.role === "user"
                       ? "bg-orange-600 text-white"
                       : "bg-zinc-800 text-zinc-100"
@@ -273,26 +369,40 @@ export default function KioskInterface() {
                 </div>
               </div>
             )}
+
+            {/* Speaking indicator */}
+            {isSpeaking && (
+              <div className="flex justify-start">
+                <div className="bg-orange-900/30 border border-orange-500/30 rounded-2xl px-4 py-2 text-xs text-orange-300 flex items-center gap-2">
+                  <span className="inline-block w-2 h-2 bg-orange-400 rounded-full animate-pulse" />
+                  Speaking...
+                </div>
+              </div>
+            )}
+
             <div ref={messagesEndRef} />
           </div>
 
           {/* Input Bar */}
-          <div className="p-4 border-t border-zinc-800 bg-zinc-950">
+          <div className="p-3 sm:p-4 border-t border-zinc-800 bg-zinc-950">
             <div className="flex items-center gap-2">
               {/* Voice Button */}
               <button
+                id="avos-mic-btn"
                 onClick={handleVoiceInput}
-                disabled={isLoading}
+                disabled={isLoading || isSpeaking}
                 className={`
                   flex-shrink-0 w-12 h-12 rounded-full flex items-center justify-center transition-all
                   ${isListening
                     ? "bg-red-500 voice-pulse"
+                    : isSpeaking
+                    ? "bg-orange-800 opacity-50"
                     : "bg-zinc-800 hover:bg-zinc-700"
                   }
                   disabled:opacity-50
                 `}
               >
-                <span className="text-xl">{isListening ? "🔴" : "🎙️"}</span>
+                <span className="text-xl">{isListening ? "🔴" : isSpeaking ? "🔊" : "🎙️"}</span>
               </button>
 
               {/* Text Input */}
@@ -303,8 +413,10 @@ export default function KioskInterface() {
                 onKeyDown={(e) => e.key === "Enter" && sendMessage(input)}
                 placeholder={isListening
                   ? (voiceLang === "zh-CN" ? "正在听..." : "Listening...")
+                  : isSpeaking
+                  ? (voiceLang === "zh-CN" ? "AI 正在说话..." : "AI is speaking...")
                   : (voiceLang === "zh-CN" ? "输入您的点餐或点击麦克风..." : "Type your order or tap the mic...")}
-                disabled={isLoading}
+                disabled={isLoading || isSpeaking}
                 readOnly={isListening}
                 className={`flex-1 bg-zinc-800 border rounded-xl px-4 py-3 text-sm text-white placeholder-zinc-500 focus:outline-none transition-colors disabled:opacity-50 ${
                   isListening ? "border-red-500 bg-zinc-800/80" : "border-zinc-700 focus:border-orange-500"
@@ -314,7 +426,7 @@ export default function KioskInterface() {
               {/* Send Button */}
               <button
                 onClick={() => sendMessage(input)}
-                disabled={isLoading || !input.trim()}
+                disabled={isLoading || !input.trim() || isSpeaking}
                 className="flex-shrink-0 w-12 h-12 rounded-full bg-orange-600 hover:bg-orange-500 flex items-center justify-center transition-colors disabled:opacity-50"
               >
                 <span className="text-xl">➤</span>
