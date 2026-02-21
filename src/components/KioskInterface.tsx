@@ -19,24 +19,54 @@ interface CardDisplay {
 }
 
 // ---------------------------------------------------------------------------
-// TTS helper — speaks text and resolves when done
+// TTS via Amazon Polly Neural — natural human-like voice
+// Falls back to browser TTS if Polly unavailable
 // ---------------------------------------------------------------------------
-function speakText(text: string, lang: "en-US" | "zh-CN"): Promise<void> {
-  return new Promise((resolve) => {
-    if (!("speechSynthesis" in window)) { resolve(); return; }
-    window.speechSynthesis.cancel(); // stop any ongoing speech
-    const utt = new SpeechSynthesisUtterance(text);
-    utt.lang = lang;
-    utt.rate = 1.05;
-    utt.pitch = 1;
-    // Try to find a matching voice
-    const voices = window.speechSynthesis.getVoices();
-    const match = voices.find((v) => v.lang.startsWith(lang.split("-")[0]));
-    if (match) utt.voice = match;
-    utt.onend = () => resolve();
-    utt.onerror = () => resolve();
-    window.speechSynthesis.speak(utt);
-  });
+let currentAudio: HTMLAudioElement | null = null;
+
+async function speakText(text: string): Promise<void> {
+  // Stop any ongoing speech
+  if (currentAudio) {
+    currentAudio.pause();
+    currentAudio = null;
+  }
+  if ("speechSynthesis" in window) window.speechSynthesis.cancel();
+
+  try {
+    const res = await fetch("/api/tts", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ text }),
+    });
+
+    if (!res.ok) throw new Error("Polly API failed");
+
+    const blob = await res.blob();
+    const url = URL.createObjectURL(blob);
+    const audio = new Audio(url);
+    currentAudio = audio;
+
+    return new Promise((resolve) => {
+      audio.onended = () => { URL.revokeObjectURL(url); currentAudio = null; resolve(); };
+      audio.onerror = () => { URL.revokeObjectURL(url); currentAudio = null; resolve(); };
+      audio.play().catch(() => resolve());
+    });
+  } catch {
+    // Fallback to browser TTS
+    return new Promise((resolve) => {
+      if (!("speechSynthesis" in window)) { resolve(); return; }
+      const utt = new SpeechSynthesisUtterance(text);
+      utt.lang = isChinese(text) ? "zh-CN" : "en-US";
+      utt.onend = () => resolve();
+      utt.onerror = () => resolve();
+      window.speechSynthesis.speak(utt);
+    });
+  }
+}
+
+function stopSpeaking() {
+  if (currentAudio) { currentAudio.pause(); currentAudio = null; }
+  if ("speechSynthesis" in window) window.speechSynthesis.cancel();
 }
 
 // Detect if text is mostly Chinese
@@ -68,13 +98,6 @@ export default function KioskInterface() {
   // Keep ref in sync
   useEffect(() => { voiceModeRef.current = voiceMode; }, [voiceMode]);
 
-  // Load voices (needed for some browsers)
-  useEffect(() => {
-    if ("speechSynthesis" in window) {
-      window.speechSynthesis.getVoices();
-      window.speechSynthesis.onvoiceschanged = () => window.speechSynthesis.getVoices();
-    }
-  }, []);
 
   const removeCard = useCallback((cardId: string) => {
     setActiveCards((prev) => prev.filter((c) => c.id !== cardId));
@@ -83,8 +106,7 @@ export default function KioskInterface() {
   // Speak assistant response and optionally auto-listen after
   const speakAndListen = useCallback(async (text: string) => {
     setIsSpeaking(true);
-    const lang = isChinese(text) ? "zh-CN" : "en-US";
-    await speakText(text, lang);
+    await speakText(text);
     setIsSpeaking(false);
     // Auto-listen if in voice mode
     if (voiceModeRef.current) {
@@ -289,7 +311,7 @@ export default function KioskInterface() {
           {/* Voice Mode Toggle */}
           {voiceMode && (
             <button
-              onClick={() => { setVoiceMode(false); voiceModeRef.current = false; window.speechSynthesis?.cancel(); }}
+              onClick={() => { setVoiceMode(false); voiceModeRef.current = false; stopSpeaking(); setIsSpeaking(false); }}
               className="px-2 py-1 rounded bg-red-600 text-white text-xs animate-pulse"
             >
               End Voice
