@@ -88,6 +88,7 @@ export default function KioskInterface() {
   const [voiceLang, setVoiceLang] = useState<"en-US" | "zh-CN">("en-US");
   const [interimText, setInterimText] = useState("");
   const [welcomed, setWelcomed] = useState(false);
+  const [waitingForVoice, setWaitingForVoice] = useState(false); // show "tap to speak" after AI speaks
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const voiceModeRef = useRef(false); // ref to avoid stale closure
 
@@ -103,17 +104,14 @@ export default function KioskInterface() {
     setActiveCards((prev) => prev.filter((c) => c.id !== cardId));
   }, []);
 
-  // Speak assistant response and optionally auto-listen after
+  // Speak assistant response and optionally prompt user to speak after
   const speakAndListen = useCallback(async (text: string) => {
     setIsSpeaking(true);
     await speakText(text);
     setIsSpeaking(false);
-    // Auto-listen if in voice mode
+    // In voice mode, show "tap to speak" prompt (mobile requires real user gesture)
     if (voiceModeRef.current) {
-      setTimeout(() => {
-        // Trigger voice input
-        document.getElementById("avos-mic-btn")?.click();
-      }, 500);
+      setWaitingForVoice(true);
     }
   }, []);
 
@@ -203,6 +201,7 @@ export default function KioskInterface() {
     }
 
     if (isListening || isSpeaking) return; // prevent double-tap or listening while speaking
+    setWaitingForVoice(false); // dismiss "tap to speak" prompt
 
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     const SpeechRecognition = (window as any).webkitSpeechRecognition || (window as any).SpeechRecognition;
@@ -244,11 +243,9 @@ export default function KioskInterface() {
       if (event.error === "not-allowed") {
         alert("Microphone access denied. Please allow microphone permission and try again.");
       } else if (event.error === "no-speech") {
-        // silent — user just didn't speak, auto-retry in voice mode
+        // User didn't speak — show tap prompt again in voice mode
         if (voiceModeRef.current) {
-          setTimeout(() => {
-            document.getElementById("avos-mic-btn")?.click();
-          }, 1000);
+          setWaitingForVoice(true);
         }
       } else {
         console.error("Speech recognition error:", event.error);
@@ -404,6 +401,19 @@ export default function KioskInterface() {
 
             <div ref={messagesEndRef} />
           </div>
+
+          {/* "Tap to Speak" prompt — shown after AI finishes speaking in voice mode */}
+          {waitingForVoice && (
+            <div className="px-4 py-3">
+              <button
+                onClick={handleVoiceInput}
+                className="w-full flex items-center justify-center gap-3 py-4 rounded-2xl bg-gradient-to-r from-orange-600 to-red-600 text-white font-medium text-lg shadow-lg shadow-orange-500/30 animate-pulse active:scale-95 transition-transform"
+              >
+                <span className="text-2xl">🎙️</span>
+                {voiceLang === "zh-CN" ? "点击说话" : "Tap to Speak"}
+              </button>
+            </div>
+          )}
 
           {/* Input Bar */}
           <div className="p-3 sm:p-4 border-t border-zinc-800 bg-zinc-950">
