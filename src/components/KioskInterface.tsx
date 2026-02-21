@@ -88,32 +88,90 @@ export default function KioskInterface() {
   const [voiceLang, setVoiceLang] = useState<"en-US" | "zh-CN">("en-US");
   const [interimText, setInterimText] = useState("");
   const [welcomed, setWelcomed] = useState(false);
-  const [waitingForVoice, setWaitingForVoice] = useState(false); // show "tap to speak" after AI speaks
+  const [waitingForVoice, setWaitingForVoice] = useState(false); // fallback "tap to speak"
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const voiceModeRef = useRef(false); // ref to avoid stale closure
+  const voiceLangRef = useRef(voiceLang);
+  const isListeningRef = useRef(false);
+  const isSpeakingRef = useRef(false);
+  // Keep a ref to sendMessage so startListening can call it without stale closure
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const sendMessageRef = useRef<(text: string) => void>(() => {});
 
   useEffect(() => {
     messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
   }, [messages]);
 
-  // Keep ref in sync
+  // Keep refs in sync
   useEffect(() => { voiceModeRef.current = voiceMode; }, [voiceMode]);
-
+  useEffect(() => { voiceLangRef.current = voiceLang; }, [voiceLang]);
+  useEffect(() => { isListeningRef.current = isListening; }, [isListening]);
+  useEffect(() => { isSpeakingRef.current = isSpeaking; }, [isSpeaking]);
 
   const removeCard = useCallback((cardId: string) => {
     setActiveCards((prev) => prev.filter((c) => c.id !== cardId));
   }, []);
 
-  // Speak assistant response and optionally prompt user to speak after
+  // Core function: start speech recognition directly (no user gesture needed after first grant)
+  const startListening = useCallback(() => {
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    if (!("webkitSpeechRecognition" in window || "SpeechRecognition" in window)) return;
+    if (isListeningRef.current || isSpeakingRef.current) return;
+
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const SpeechRecognition = (window as any).webkitSpeechRecognition || (window as any).SpeechRecognition;
+    const recognition = new SpeechRecognition();
+    recognition.continuous = false;
+    recognition.interimResults = true;
+    recognition.lang = voiceLangRef.current;
+
+    recognition.onstart = () => { setIsListening(true); setInterimText(""); };
+    recognition.onend = () => { setIsListening(false); setInterimText(""); };
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    recognition.onresult = (event: any) => {
+      let finalTranscript = "";
+      let interim = "";
+      for (let i = 0; i < event.results.length; i++) {
+        if (event.results[i].isFinal) finalTranscript += event.results[i][0].transcript;
+        else interim += event.results[i][0].transcript;
+      }
+      if (finalTranscript) { setInterimText(""); sendMessageRef.current(finalTranscript); }
+      else setInterimText(interim);
+    };
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    recognition.onerror = (event: any) => {
+      setIsListening(false);
+      setInterimText("");
+      if (event.error === "not-allowed") {
+        // Permission denied — show tap button as fallback
+        if (voiceModeRef.current) setWaitingForVoice(true);
+      } else if (event.error === "no-speech") {
+        // User didn't speak — auto-retry in voice mode
+        if (voiceModeRef.current) {
+          setTimeout(() => startListening(), 500);
+        }
+      }
+    };
+
+    try {
+      recognition.start();
+      setWaitingForVoice(false);
+    } catch {
+      // start() threw — show fallback tap button
+      if (voiceModeRef.current) setWaitingForVoice(true);
+    }
+  }, []);
+
+  // Speak assistant response then auto-listen
   const speakAndListen = useCallback(async (text: string) => {
     setIsSpeaking(true);
     await speakText(text);
     setIsSpeaking(false);
-    // In voice mode, show "tap to speak" prompt (mobile requires real user gesture)
+    // Auto-start listening in voice mode
     if (voiceModeRef.current) {
-      setWaitingForVoice(true);
+      setTimeout(() => startListening(), 300);
     }
-  }, []);
+  }, [startListening]);
 
   const sendMessage = useCallback(
     async (text: string) => {
@@ -176,6 +234,9 @@ export default function KioskInterface() {
     [isLoading, messages, speakAndListen]
   );
 
+  // Keep sendMessage ref in sync for startListening callback
+  useEffect(() => { sendMessageRef.current = sendMessage; }, [sendMessage]);
+
   // Start voice conversation — welcome + auto-listen
   const startVoiceConversation = useCallback(async () => {
     setVoiceMode(true);
@@ -194,65 +255,12 @@ export default function KioskInterface() {
   }, [voiceLang, speakAndListen]);
 
   const handleVoiceInput = useCallback(() => {
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
     if (!("webkitSpeechRecognition" in window || "SpeechRecognition" in window)) {
       alert("Voice input is not supported in this browser. Please use Chrome or Edge.");
       return;
     }
-
-    if (isListening || isSpeaking) return; // prevent double-tap or listening while speaking
-    setWaitingForVoice(false); // dismiss "tap to speak" prompt
-
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    const SpeechRecognition = (window as any).webkitSpeechRecognition || (window as any).SpeechRecognition;
-    const recognition = new SpeechRecognition();
-    recognition.continuous = false;
-    recognition.interimResults = true;
-    recognition.lang = voiceLang;
-
-    recognition.onstart = () => {
-      setIsListening(true);
-      setInterimText("");
-    };
-    recognition.onend = () => {
-      setIsListening(false);
-      setInterimText("");
-    };
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    recognition.onresult = (event: any) => {
-      let finalTranscript = "";
-      let interim = "";
-      for (let i = 0; i < event.results.length; i++) {
-        if (event.results[i].isFinal) {
-          finalTranscript += event.results[i][0].transcript;
-        } else {
-          interim += event.results[i][0].transcript;
-        }
-      }
-      if (finalTranscript) {
-        setInterimText("");
-        sendMessage(finalTranscript);
-      } else {
-        setInterimText(interim);
-      }
-    };
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    recognition.onerror = (event: any) => {
-      setIsListening(false);
-      setInterimText("");
-      if (event.error === "not-allowed") {
-        alert("Microphone access denied. Please allow microphone permission and try again.");
-      } else if (event.error === "no-speech") {
-        // User didn't speak — show tap prompt again in voice mode
-        if (voiceModeRef.current) {
-          setWaitingForVoice(true);
-        }
-      } else {
-        console.error("Speech recognition error:", event.error);
-      }
-    };
-    recognition.start();
-  }, [sendMessage, voiceLang, isListening, isSpeaking]);
+    startListening();
+  }, [startListening]);
 
   return (
     <div className="h-screen flex flex-col bg-[#0a0a0a]">
