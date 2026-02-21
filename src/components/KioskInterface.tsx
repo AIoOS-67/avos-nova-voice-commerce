@@ -25,11 +25,7 @@ interface CardDisplay {
 let currentAudio: HTMLAudioElement | null = null;
 
 async function speakText(text: string): Promise<void> {
-  // Stop any ongoing speech
-  if (currentAudio) {
-    currentAudio.pause();
-    currentAudio = null;
-  }
+  if (currentAudio) { currentAudio.pause(); currentAudio = null; }
   if ("speechSynthesis" in window) window.speechSynthesis.cancel();
 
   try {
@@ -38,7 +34,6 @@ async function speakText(text: string): Promise<void> {
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ text }),
     });
-
     if (!res.ok) throw new Error("Polly API failed");
 
     const blob = await res.blob();
@@ -52,7 +47,6 @@ async function speakText(text: string): Promise<void> {
       audio.play().catch(() => resolve());
     });
   } catch {
-    // Fallback to browser TTS
     return new Promise((resolve) => {
       if (!("speechSynthesis" in window)) { resolve(); return; }
       const utt = new SpeechSynthesisUtterance(text);
@@ -69,7 +63,6 @@ function stopSpeaking() {
   if ("speechSynthesis" in window) window.speechSynthesis.cancel();
 }
 
-// Detect if text is mostly Chinese
 function isChinese(text: string): boolean {
   const zhChars = text.match(/[\u4e00-\u9fff]/g);
   return !!zhChars && zhChars.length > text.length * 0.15;
@@ -81,49 +74,42 @@ export default function KioskInterface() {
   const [isLoading, setIsLoading] = useState(false);
   const [isListening, setIsListening] = useState(false);
   const [isSpeaking, setIsSpeaking] = useState(false);
-  const [voiceMode, setVoiceMode] = useState(false); // full voice conversation mode
+  const [voiceMode, setVoiceMode] = useState(false);
   const [activeCards, setActiveCards] = useState<CardDisplay[]>([]);
   const [cartCount, setCartCount] = useState(0);
   const [cartTotal, setCartTotal] = useState(0);
   const [voiceLang, setVoiceLang] = useState<"en-US" | "zh-CN">("en-US");
   const [interimText, setInterimText] = useState("");
   const [welcomed, setWelcomed] = useState(false);
-  const [waitingForVoice, setWaitingForVoice] = useState(false); // fallback "tap to speak"
+  const [waitingForVoice, setWaitingForVoice] = useState(false);
+  // Voice result stored here — useEffect picks it up and calls sendMessage
+  const [pendingVoiceInput, setPendingVoiceInput] = useState<string | null>(null);
+  // Signal: "AI finished speaking, start listening"
+  const [shouldListen, setShouldListen] = useState(false);
+
   const messagesEndRef = useRef<HTMLDivElement>(null);
-  const voiceModeRef = useRef(false); // ref to avoid stale closure
-  const voiceLangRef = useRef(voiceLang);
-  const isListeningRef = useRef(false);
-  const isSpeakingRef = useRef(false);
-  // Keep a ref to sendMessage so startListening can call it without stale closure
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  const sendMessageRef = useRef<(text: string) => void>(() => {});
+  const voiceModeRef = useRef(false);
 
   useEffect(() => {
     messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
   }, [messages]);
 
-  // Keep refs in sync
   useEffect(() => { voiceModeRef.current = voiceMode; }, [voiceMode]);
-  useEffect(() => { voiceLangRef.current = voiceLang; }, [voiceLang]);
-  useEffect(() => { isListeningRef.current = isListening; }, [isListening]);
-  useEffect(() => { isSpeakingRef.current = isSpeaking; }, [isSpeaking]);
 
   const removeCard = useCallback((cardId: string) => {
     setActiveCards((prev) => prev.filter((c) => c.id !== cardId));
   }, []);
 
-  // Core function: start speech recognition directly (no user gesture needed after first grant)
-  const startListening = useCallback(() => {
+  // ---- Start speech recognition ----
+  const startListening = useCallback((lang: string) => {
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    if (!("webkitSpeechRecognition" in window || "SpeechRecognition" in window)) return;
-    if (isListeningRef.current || isSpeakingRef.current) return;
+    const SR = (window as any).webkitSpeechRecognition || (window as any).SpeechRecognition;
+    if (!SR) return;
 
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    const SpeechRecognition = (window as any).webkitSpeechRecognition || (window as any).SpeechRecognition;
-    const recognition = new SpeechRecognition();
+    const recognition = new SR();
     recognition.continuous = false;
     recognition.interimResults = true;
-    recognition.lang = voiceLangRef.current;
+    recognition.lang = lang;
 
     recognition.onstart = () => { setIsListening(true); setInterimText(""); };
     recognition.onend = () => { setIsListening(false); setInterimText(""); };
@@ -135,21 +121,22 @@ export default function KioskInterface() {
         if (event.results[i].isFinal) finalTranscript += event.results[i][0].transcript;
         else interim += event.results[i][0].transcript;
       }
-      if (finalTranscript) { setInterimText(""); sendMessageRef.current(finalTranscript); }
-      else setInterimText(interim);
+      if (finalTranscript) {
+        setInterimText("");
+        setPendingVoiceInput(finalTranscript); // triggers useEffect → sendMessage
+      } else {
+        setInterimText(interim);
+      }
     };
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     recognition.onerror = (event: any) => {
       setIsListening(false);
       setInterimText("");
       if (event.error === "not-allowed") {
-        // Permission denied — show tap button as fallback
         if (voiceModeRef.current) setWaitingForVoice(true);
       } else if (event.error === "no-speech") {
-        // User didn't speak — auto-retry in voice mode
-        if (voiceModeRef.current) {
-          setTimeout(() => startListening(), 500);
-        }
+        // No speech detected — auto-retry in voice mode
+        if (voiceModeRef.current) setShouldListen(true);
       }
     };
 
@@ -157,22 +144,30 @@ export default function KioskInterface() {
       recognition.start();
       setWaitingForVoice(false);
     } catch {
-      // start() threw — show fallback tap button
       if (voiceModeRef.current) setWaitingForVoice(true);
     }
   }, []);
 
-  // Speak assistant response then auto-listen
+  // ---- Effect: auto-start listening when signaled ----
+  useEffect(() => {
+    if (!shouldListen) return;
+    setShouldListen(false);
+    // Small delay to let state settle
+    const t = setTimeout(() => startListening(voiceLang), 300);
+    return () => clearTimeout(t);
+  }, [shouldListen, voiceLang, startListening]);
+
+  // ---- Speak then signal to listen ----
   const speakAndListen = useCallback(async (text: string) => {
     setIsSpeaking(true);
     await speakText(text);
     setIsSpeaking(false);
-    // Auto-start listening in voice mode
     if (voiceModeRef.current) {
-      setTimeout(() => startListening(), 300);
+      setShouldListen(true);
     }
-  }, [startListening]);
+  }, []);
 
+  // ---- Send message to API ----
   const sendMessage = useCallback(
     async (text: string) => {
       if (!text.trim() || isLoading) return;
@@ -191,17 +186,14 @@ export default function KioskInterface() {
 
         const data = await res.json();
 
-        // Add assistant message
         if (data.response) {
           setMessages((prev) => [
             ...prev,
             { role: "assistant", content: data.response, timestamp: Date.now() },
           ]);
-          // Speak the response
           speakAndListen(data.response);
         }
 
-        // Process bridge cards (Patent #28 core)
         if (data.cards && data.cards.length > 0) {
           for (const card of data.cards) {
             const cardDisplay: CardDisplay = {
@@ -215,7 +207,6 @@ export default function KioskInterface() {
           }
         }
 
-        // Update cart state
         if (data.cartState) {
           setCartCount(data.cartState.itemCount || 0);
           setCartTotal(data.cartState.total || 0);
@@ -234,10 +225,16 @@ export default function KioskInterface() {
     [isLoading, messages, speakAndListen]
   );
 
-  // Keep sendMessage ref in sync for startListening callback
-  useEffect(() => { sendMessageRef.current = sendMessage; }, [sendMessage]);
+  // ---- Effect: process voice input → sendMessage ----
+  useEffect(() => {
+    if (pendingVoiceInput && !isLoading) {
+      const text = pendingVoiceInput;
+      setPendingVoiceInput(null);
+      sendMessage(text);
+    }
+  }, [pendingVoiceInput, isLoading, sendMessage]);
 
-  // Start voice conversation — welcome + auto-listen
+  // ---- Start voice conversation ----
   const startVoiceConversation = useCallback(async () => {
     setVoiceMode(true);
     voiceModeRef.current = true;
@@ -250,17 +247,18 @@ export default function KioskInterface() {
     setMessages((prev) => [...prev, greetMsg]);
     setWelcomed(true);
 
-    // Speak greeting, then auto-listen
     await speakAndListen(greeting);
   }, [voiceLang, speakAndListen]);
 
   const handleVoiceInput = useCallback(() => {
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
     if (!("webkitSpeechRecognition" in window || "SpeechRecognition" in window)) {
       alert("Voice input is not supported in this browser. Please use Chrome or Edge.");
       return;
     }
-    startListening();
-  }, [startListening]);
+    if (isListening || isSpeaking) return;
+    startListening(voiceLang);
+  }, [startListening, voiceLang, isListening, isSpeaking]);
 
   return (
     <div className="h-screen flex flex-col bg-[#0a0a0a]">
@@ -278,7 +276,6 @@ export default function KioskInterface() {
           </div>
         </div>
         <div className="flex items-center gap-2 sm:gap-4">
-          {/* Cart */}
           <button
             onClick={() => sendMessage("What is my total?")}
             className="flex items-center gap-2 bg-zinc-800 hover:bg-zinc-700 px-3 py-1.5 rounded-lg transition-colors"
@@ -289,38 +286,26 @@ export default function KioskInterface() {
               <span className="text-xs text-green-400">${cartTotal.toFixed(2)}</span>
             )}
           </button>
-          {/* Language Toggle */}
           <div className="flex items-center gap-1 text-xs">
             <button
               onClick={() => setVoiceLang("en-US")}
               className={`px-2 py-1 rounded transition-colors ${
-                voiceLang === "en-US"
-                  ? "bg-orange-600 text-white"
-                  : "bg-zinc-800 text-zinc-400 hover:bg-zinc-700"
+                voiceLang === "en-US" ? "bg-orange-600 text-white" : "bg-zinc-800 text-zinc-400 hover:bg-zinc-700"
               }`}
-            >
-              EN
-            </button>
+            >EN</button>
             <span className="text-zinc-500">/</span>
             <button
               onClick={() => setVoiceLang("zh-CN")}
               className={`px-2 py-1 rounded transition-colors ${
-                voiceLang === "zh-CN"
-                  ? "bg-orange-600 text-white"
-                  : "bg-zinc-800 text-zinc-400 hover:bg-zinc-700"
+                voiceLang === "zh-CN" ? "bg-orange-600 text-white" : "bg-zinc-800 text-zinc-400 hover:bg-zinc-700"
               }`}
-            >
-              中文
-            </button>
+            >中文</button>
           </div>
-          {/* Voice Mode Toggle */}
           {voiceMode && (
             <button
-              onClick={() => { setVoiceMode(false); voiceModeRef.current = false; stopSpeaking(); setIsSpeaking(false); }}
+              onClick={() => { setVoiceMode(false); voiceModeRef.current = false; stopSpeaking(); setIsSpeaking(false); setShouldListen(false); }}
               className="px-2 py-1 rounded bg-red-600 text-white text-xs animate-pulse"
-            >
-              End Voice
-            </button>
+            >End Voice</button>
           )}
         </div>
       </header>
@@ -329,9 +314,8 @@ export default function KioskInterface() {
       <div className="flex-1 flex overflow-hidden">
         {/* Chat Panel */}
         <div className="flex-1 flex flex-col min-w-0">
-          {/* Messages */}
           <div className="flex-1 overflow-y-auto p-4 space-y-3">
-            {/* Welcome — start voice conversation */}
+            {/* Welcome screen */}
             {messages.length === 0 && !welcomed && (
               <div className="flex flex-col items-center justify-center h-full text-center space-y-6">
                 <div className="text-6xl">🍜</div>
@@ -339,47 +323,28 @@ export default function KioskInterface() {
                 <p className="text-sm text-zinc-400 max-w-md">
                   AI Voice Ordering System — speak naturally to order!
                 </p>
-
-                {/* Big Start Voice Button */}
                 <button
                   onClick={startVoiceConversation}
                   className="w-24 h-24 rounded-full bg-gradient-to-br from-orange-500 to-red-600 flex items-center justify-center text-4xl shadow-lg shadow-orange-500/30 hover:shadow-orange-500/50 hover:scale-105 transition-all active:scale-95"
-                >
-                  🎙️
-                </button>
+                >🎙️</button>
                 <p className="text-xs text-zinc-500">Tap to start voice conversation</p>
-
                 <div className="flex flex-wrap gap-2 justify-center mt-2">
-                  {[
-                    "What's on the menu?",
-                    "I'll have General Tso's Chicken",
-                    "我要炒饭",
-                    "What do you recommend?",
-                  ].map((suggestion) => (
+                  {["What's on the menu?", "I'll have General Tso's Chicken", "我要炒饭", "What do you recommend?"].map((s) => (
                     <button
-                      key={suggestion}
-                      onClick={() => { setWelcomed(true); sendMessage(suggestion); }}
+                      key={s}
+                      onClick={() => { setWelcomed(true); sendMessage(s); }}
                       className="text-xs bg-zinc-800 hover:bg-zinc-700 px-3 py-1.5 rounded-full transition-colors border border-zinc-700"
-                    >
-                      {suggestion}
-                    </button>
+                    >{s}</button>
                   ))}
                 </div>
               </div>
             )}
 
             {messages.map((msg, i) => (
-              <div
-                key={i}
-                className={`flex ${msg.role === "user" ? "justify-end" : "justify-start"}`}
-              >
-                <div
-                  className={`max-w-[85%] rounded-2xl px-4 py-2.5 ${
-                    msg.role === "user"
-                      ? "bg-orange-600 text-white"
-                      : "bg-zinc-800 text-zinc-100"
-                  }`}
-                >
+              <div key={i} className={`flex ${msg.role === "user" ? "justify-end" : "justify-start"}`}>
+                <div className={`max-w-[85%] rounded-2xl px-4 py-2.5 ${
+                  msg.role === "user" ? "bg-orange-600 text-white" : "bg-zinc-800 text-zinc-100"
+                }`}>
                   <p className="text-sm whitespace-pre-wrap">{msg.content}</p>
                 </div>
               </div>
@@ -397,7 +362,6 @@ export default function KioskInterface() {
               </div>
             )}
 
-            {/* Speaking indicator */}
             {isSpeaking && (
               <div className="flex justify-start">
                 <div className="bg-orange-900/30 border border-orange-500/30 rounded-2xl px-4 py-2 text-xs text-orange-300 flex items-center gap-2">
@@ -407,10 +371,20 @@ export default function KioskInterface() {
               </div>
             )}
 
+            {/* Listening indicator */}
+            {isListening && voiceMode && (
+              <div className="flex justify-start">
+                <div className="bg-red-900/30 border border-red-500/30 rounded-2xl px-4 py-2 text-xs text-red-300 flex items-center gap-2">
+                  <span className="inline-block w-2 h-2 bg-red-400 rounded-full animate-pulse" />
+                  {voiceLang === "zh-CN" ? "正在听你说话..." : "Listening..."}
+                </div>
+              </div>
+            )}
+
             <div ref={messagesEndRef} />
           </div>
 
-          {/* "Tap to Speak" prompt — shown after AI finishes speaking in voice mode */}
+          {/* Fallback tap-to-speak (only if auto-start fails) */}
           {waitingForVoice && (
             <div className="px-4 py-3">
               <button
@@ -426,26 +400,15 @@ export default function KioskInterface() {
           {/* Input Bar */}
           <div className="p-3 sm:p-4 border-t border-zinc-800 bg-zinc-950">
             <div className="flex items-center gap-2">
-              {/* Voice Button */}
               <button
-                id="avos-mic-btn"
                 onClick={handleVoiceInput}
                 disabled={isLoading || isSpeaking}
-                className={`
-                  flex-shrink-0 w-12 h-12 rounded-full flex items-center justify-center transition-all
-                  ${isListening
-                    ? "bg-red-500 voice-pulse"
-                    : isSpeaking
-                    ? "bg-orange-800 opacity-50"
-                    : "bg-zinc-800 hover:bg-zinc-700"
-                  }
-                  disabled:opacity-50
-                `}
+                className={`flex-shrink-0 w-12 h-12 rounded-full flex items-center justify-center transition-all ${
+                  isListening ? "bg-red-500 voice-pulse" : isSpeaking ? "bg-orange-800 opacity-50" : "bg-zinc-800 hover:bg-zinc-700"
+                } disabled:opacity-50`}
               >
                 <span className="text-xl">{isListening ? "🔴" : isSpeaking ? "🔊" : "🎙️"}</span>
               </button>
-
-              {/* Text Input */}
               <input
                 type="text"
                 value={isListening && interimText ? interimText : input}
@@ -462,8 +425,6 @@ export default function KioskInterface() {
                   isListening ? "border-red-500 bg-zinc-800/80" : "border-zinc-700 focus:border-orange-500"
                 }`}
               />
-
-              {/* Send Button */}
               <button
                 onClick={() => sendMessage(input)}
                 disabled={isLoading || !input.trim() || isSpeaking}
@@ -475,25 +436,22 @@ export default function KioskInterface() {
           </div>
         </div>
 
-        {/* Card Panel (Patent #28: Frontend Card Renderer) */}
+        {/* Card Panel */}
         <div className="w-96 border-l border-zinc-800 bg-zinc-950/50 p-4 overflow-y-auto hidden lg:block">
           <div className="flex items-center gap-2 mb-4">
             <div className="w-2 h-2 rounded-full bg-green-500 risk-pulse" />
             <h3 className="text-sm font-medium text-zinc-400">Live Product Cards</h3>
             <span className="text-xs text-zinc-600 ml-auto">Tool-Call-to-UI Bridge</span>
           </div>
-
           {activeCards.length === 0 && (
             <div className="flex flex-col items-center justify-center h-64 text-center opacity-40">
               <div className="text-3xl mb-2">📋</div>
               <p className="text-xs text-zinc-500">
-                Product cards will appear here as you order.
-                <br />
+                Product cards will appear here as you order.<br />
                 Powered by Patent #28 Bridge technology.
               </p>
             </div>
           )}
-
           <div className="space-y-4">
             {activeCards.map((card) => {
               if (card.type === "product_card" || card.type === "recommendation_card") {
